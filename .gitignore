@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+models/*.bin
+models/*.gguf
+transcripts/*.log
+transcripts/*.wav
+.DS_Store
+.claude/skills/win-speaker-transcribe/SKILL.md
+CLAUDE.md

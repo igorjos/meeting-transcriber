@@ -1,0 +1,32 @@
+# --- Audio capture ---
+# Windows: WASAPI loopback via PyAudioWPatch.
+PyAudioWPatch>=0.2.12.7; sys_platform == "win32"
+# macOS: ScreenCaptureKit (macOS 13+) audio capture via PyObjC bindings.
+# No virtual audio driver / Multi-Output Device needed, but the process
+# running this (your terminal, or python3.x if run directly) must be granted
+# Screen Recording permission in System Settings > Privacy & Security ->
+# Screen Recording - required by macOS for any system-audio capture, even
+# though no video is recorded.
+pyobjc-framework-Cocoa>=10.1; sys_platform == "darwin"
+pyobjc-framework-ScreenCaptureKit>=10.1; sys_platform == "darwin"
+pyobjc-framework-CoreMedia>=10.1; sys_platform == "darwin"
+pyobjc-framework-CoreAudio>=10.1; sys_platform == "darwin"
+pyobjc-framework-libdispatch>=10.1; sys_platform == "darwin"
+
+# --- Numerics / resampling ---
+numpy>=1.24
+
+# --- VAD ---
+# NOTE: the silero-vad PyPI package hard-depends on torch/torchaudio even
+# though we only use its small speech-detection model, not an LLM - this is
+# the heaviest install in this project (~a few hundred MB), unrelated to the
+# ASR model choice below. On Windows this also needs the Microsoft Visual
+# C++ Redistributable (x64) installed for torch's native DLLs to load.
+silero-vad>=5.1
+
+# --- ASR (whisper.cpp bindings) ---
+# Builds/links whisper.cpp under the hood. On Windows this needs the
+# "Desktop development with C++" workload (MSVC + CMake) unless a
+# prebuilt wheel is available for your Python/OS combo. On macOS this
+# typically builds cleanly against Xcode Command Line Tools.
+pywhispercpp>=1.2.0
