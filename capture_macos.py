@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import ctypes
 import queue
+import sys
 import threading
 import time
 from typing import Optional
@@ -350,20 +351,44 @@ class LoopbackCapture:
         self._monitor_thread.start()
 
     def _monitor(self) -> None:
-        """Watches for silence_timeout with no audio delivered, same contract as Windows'
-        in-loop check - data itself arrives via `_on_audio_sample_buffer`, not here."""
+        """Watches for extended silence, same contract as Windows' in-loop
+        check - data itself arrives via `_on_audio_sample_buffer`, not here.
+
+        Before any audio has ever arrived, silence past `silence_timeout` is
+        fatal - almost always the wrong capture target or missing Screen
+        Recording permission, so failing fast beats hanging forever. Once
+        audio has flowed at least once, a later quiet stretch (e.g. a muted
+        meeting) is normal - ScreenCaptureKit simply stops delivering sample
+        buffers when there's genuinely nothing to capture - so it's only
+        logged as a warning, never treated as fatal.
+        """
+        warned_silent = False
         while not self._stop_event.is_set():
             time.sleep(0.5)
             with self._lock:
                 last = self._last_data_time
-            if last is not None and time.monotonic() - last > self.silence_timeout:
-                self._error = NoAudioError(
-                    f"No audio received via ScreenCaptureKit for {self.silence_timeout:.0f}s. "
-                    "Is anything actually playing? If this is the first run, check System "
-                    "Settings -> Privacy & Security -> Screen Recording and confirm this "
-                    "app/terminal has access, then restart it and retry."
-                )
-                break
+            if last is None:
+                continue
+            silent_for = time.monotonic() - last
+            if self._frames_captured == 0:
+                if silent_for > self.silence_timeout:
+                    self._error = NoAudioError(
+                        f"No audio received via ScreenCaptureKit for {self.silence_timeout:.0f}s. "
+                        "Is anything actually playing? If this is the first run, check System "
+                        "Settings -> Privacy & Security -> Screen Recording and confirm this "
+                        "app/terminal has access, then restart it and retry."
+                    )
+                    return
+            elif silent_for > self.silence_timeout:
+                if not warned_silent:
+                    print(
+                        f"WARNING: no audio via ScreenCaptureKit for {silent_for:.0f}s "
+                        "(meeting muted or quiet?).",
+                        file=sys.stderr,
+                    )
+                    warned_silent = True
+            else:
+                warned_silent = False
 
     def _on_audio_sample_buffer(self, sample_buffer) -> None:
         try:

@@ -85,6 +85,11 @@ class VoiceActivityDetector:
         if self._thread is not None:
             self._thread.join(timeout=timeout)
             self._thread = None
+        # The thread is joined (no longer touching this state), so flushing
+        # here is race-free: whatever utterance was still in progress when
+        # stopped is emitted as a final segment instead of silently dropped.
+        if self._speech_start_sample is not None:
+            self._emit_segment()
 
     def _run(self) -> None:
         while not self._stop_event.is_set():

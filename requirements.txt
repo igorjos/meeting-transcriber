@@ -15,6 +15,10 @@ pyobjc-framework-libdispatch>=10.1; sys_platform == "darwin"
 
 # --- Numerics / resampling ---
 numpy>=1.24
+# audio_common.py uses stdlib `audioop`, removed from the standard library in
+# Python 3.13 - this restores it (same module name/API) so 3.13+ venvs don't
+# pass every setup check and then die at the first audio chunk.
+audioop-lts>=0.2.1; python_version >= "3.13"
 
 # --- VAD ---
 # NOTE: the silero-vad PyPI package hard-depends on torch/torchaudio even

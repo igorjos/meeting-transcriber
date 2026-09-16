@@ -13,6 +13,7 @@ they're on.
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 import time
 from typing import Optional
@@ -148,6 +149,7 @@ class LoopbackCapture:
     def _run(self, in_rate: int, in_channels: int, frames_per_chunk: int) -> None:
         resample_state = None
         last_data_time = time.monotonic()
+        warned_silent = False
         try:
             while not self._stop_event.is_set():
                 try:
@@ -157,18 +159,33 @@ class LoopbackCapture:
                     break
 
                 if not raw:
-                    if time.monotonic() - last_data_time > self.silence_timeout:
-                        self._error = NoAudioError(
-                            f"No audio received from device {self._device_info['index']} "
-                            f"({self._device_info['name']!r}) for "
-                            f"{self.silence_timeout:.0f}s. Is anything actually playing "
-                            "through that output device? Run --list-devices and double-check "
-                            "you picked the device matching your active speakers/headset."
+                    silent_for = time.monotonic() - last_data_time
+                    if self._frames_captured == 0:
+                        # Nothing has ever come through - almost always the
+                        # wrong --device. Fail fast instead of hanging forever.
+                        if silent_for > self.silence_timeout:
+                            self._error = NoAudioError(
+                                f"No audio received from device {self._device_info['index']} "
+                                f"({self._device_info['name']!r}) for "
+                                f"{self.silence_timeout:.0f}s. Is anything actually playing "
+                                "through that output device? Run --list-devices and double-check "
+                                "you picked the device matching your active speakers/headset."
+                            )
+                            break
+                    elif silent_for > self.silence_timeout and not warned_silent:
+                        # Audio has flowed before - a later quiet stretch (e.g.
+                        # a muted meeting) is normal, not a device problem, so
+                        # it's only ever a warning, never fatal.
+                        print(
+                            f"WARNING: no audio from device {self._device_info['index']} for "
+                            f"{silent_for:.0f}s (nothing playing?).",
+                            file=sys.stderr,
                         )
-                        break
+                        warned_silent = True
                     continue
 
                 last_data_time = time.monotonic()
+                warned_silent = False
                 self._frames_captured += 1
                 self._bytes_captured += len(raw)
 
