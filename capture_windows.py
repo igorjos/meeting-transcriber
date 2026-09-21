@@ -119,6 +119,12 @@ class LoopbackCapture:
     def bytes_captured(self) -> int:
         return self._bytes_captured
 
+    @property
+    def stopped_by_user(self) -> bool:
+        # WASAPI loopback has no equivalent of ScreenCaptureKit's system
+        # stop-sharing control; always False on this backend.
+        return False
+
     def start(self) -> None:
         self._pa = pyaudio.PyAudio()
         self._device_info = _resolve_device(self._pa, self.device_index)

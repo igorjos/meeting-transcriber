@@ -178,6 +178,8 @@ def _cmd_test(device_index: Optional[int], seconds: float) -> None:
             seg = seg_queue.get(timeout=0.5)
         except queue.Empty:
             cap.raise_if_failed()
+            if cap.stopped_by_user:
+                break
             continue
         segments_found += 1
         print(f"  segment {segments_found}: {seg.start_s:.2f}s -> {seg.end_s:.2f}s ({seg.duration_s:.2f}s of speech)")

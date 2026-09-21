@@ -10,7 +10,7 @@ Usage:
     python -m transcribe --device 10
     python -m transcribe --device 10 --model tiny.en-q5_1 --output transcripts\\meeting.log
     python -m transcribe --device 10 --streaming --url http://localhost:8000/ingest
-        (each POST body includes: {sentence, model, language, session_id})
+        (each POST body includes: {sentence, model, language, session_id, speaker_id})
 """
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ import json
 import os
 import queue
 import re
+import signal
 import sys
 import threading
 import time
@@ -31,6 +32,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from capture import LoopbackCapture, NoAudioError, list_loopback_devices
+from speaker_id import DEFAULT_SPEAKER_THRESHOLD, SpeakerRegistry
 from vad import SpeechSegment, VoiceActivityDetector
 
 PROJECT_DIR = Path(__file__).resolve().parent
@@ -100,26 +102,32 @@ class SentencePoster:
         self.max_retries = max_retries
         self.timeout = timeout
 
-        self._queue: "queue.Queue[Optional[str]]" = queue.Queue(maxsize=256)
+        self._queue: "queue.Queue[Optional[tuple[str, int]]]" = queue.Queue(maxsize=256)
         self._thread = threading.Thread(target=self._run, name="sentence-poster", daemon=True)
         self._thread.start()
 
-    def post(self, sentence: str) -> None:
+    def post(self, sentence: str, speaker_id: int) -> None:
         try:
-            self._queue.put_nowait(sentence)
+            self._queue.put_nowait((sentence, speaker_id))
         except queue.Full:
             print(f"WARNING: streaming queue full, dropping sentence: {sentence!r}", file=sys.stderr)
 
     def _run(self) -> None:
         while True:
-            sentence = self._queue.get()
-            if sentence is None:  # shutdown sentinel from stop()
+            item = self._queue.get()
+            if item is None:  # shutdown sentinel from stop()
                 return
-            self._post_with_retry(sentence)
+            self._post_with_retry(*item)
 
-    def _post_with_retry(self, sentence: str) -> None:
+    def _post_with_retry(self, sentence: str, speaker_id: int) -> None:
         body = json.dumps(
-            {"sentence": sentence, "model": self.model, "language": self.language, "session_id": self.session_id}
+            {
+                "sentence": sentence,
+                "model": self.model,
+                "language": self.language,
+                "session_id": self.session_id,
+                "speaker_id": speaker_id,
+            }
         ).encode("utf-8")
         for attempt in range(self.max_retries + 1):
             req = urllib.request.Request(
@@ -160,23 +168,27 @@ def _process_segment(
     session_start: dt.datetime,
     writer: Optional[TranscriptWriter],
     poster: Optional[SentencePoster],
+    speakers: SpeakerRegistry,
 ) -> None:
     segments = model.transcribe(segment.audio)
     text = _clean_text(segments)
     if not text:
         return
 
+    speaker_id = speakers.identify(segment.audio)
+
     if args.streaming:
-        print(f"[{dt.datetime.now().strftime('%H:%M:%S')}] {text}")
-        poster.post(text)
+        print(f"[{dt.datetime.now().strftime('%H:%M:%S')} - Person {speaker_id}] said: {text}")
+        poster.post(text, speaker_id)
     else:
         line_ts = (session_start + dt.timedelta(seconds=segment.start_s)).strftime("%H:%M:%S")
-        writer.write(f"[{line_ts}] {text}")
+        writer.write(f"[{line_ts} - Person {speaker_id}] said: {text}")
 
 
 def run(args: argparse.Namespace) -> int:
     session_start = dt.datetime.now()
     session_id = str(uuid.uuid4())
+    speakers = SpeakerRegistry(threshold=args.speaker_threshold)
     writer: Optional[TranscriptWriter] = None
     poster: Optional[SentencePoster] = None
     if args.streaming:
@@ -240,6 +252,9 @@ def run(args: argparse.Namespace) -> int:
                     print(f"\nERROR: {exc}", file=sys.stderr)
                     exit_code = 1
                     break
+                if cap.stopped_by_user:
+                    print("\nCapture stopped (via the system's stop-sharing control).")
+                    break
                 if not got_first_segment and time.monotonic() > next_warning_at:
                     print(
                         "WARNING: no speech detected yet. If this is unexpected, confirm "
@@ -251,21 +266,46 @@ def run(args: argparse.Namespace) -> int:
                 continue
 
             got_first_segment = True
-            _process_segment(segment, model, args, session_start, writer, poster)
+            _process_segment(segment, model, args, session_start, writer, poster, speakers)
     except KeyboardInterrupt:
         pass
     finally:
         print("\nStopping...")
+
+        def _force_exit(signum, frame):
+            # whisper.cpp's transcribe() is a blocking native call that never
+            # checks for Python signals, so without the drain thread below a
+            # slow trailing transcription would swallow Ctrl+C entirely until
+            # it finished. This handler is armed only once graceful shutdown
+            # has begun, so a second Ctrl+C always gets through instead of
+            # requiring a force-kill.
+            print("\nForce-stopping (second Ctrl+C) - the in-progress transcription may be lost.")
+            sys.exit(1)
+
+        signal.signal(signal.SIGINT, _force_exit)
+
         # detector.stop() flushes whatever utterance was still in progress
         # onto seg_queue, so draining it below picks up the session's final
         # segment instead of silently dropping it.
         detector.stop()
-        while True:
-            try:
-                trailing_segment = seg_queue.get_nowait()
-            except queue.Empty:
-                break
-            _process_segment(trailing_segment, model, args, session_start, writer, poster)
+
+        def _drain_trailing_segments() -> None:
+            while True:
+                try:
+                    trailing_segment = seg_queue.get_nowait()
+                except queue.Empty:
+                    return
+                _process_segment(trailing_segment, model, args, session_start, writer, poster, speakers)
+
+        # Runs on a daemon thread rather than inline so _force_exit above can
+        # actually preempt it: a signal handler only runs once the main
+        # thread reaches a Python bytecode checkpoint, which it never does
+        # while itself stuck inside transcribe()'s native call.
+        drain_thread = threading.Thread(target=_drain_trailing_segments, name="shutdown-drain", daemon=True)
+        drain_thread.start()
+        while drain_thread.is_alive():
+            drain_thread.join(timeout=0.2)
+
         cap.stop()
         if writer is not None:
             writer.close()
@@ -302,6 +342,16 @@ def main(argv: Optional[List[str]] = None) -> None:
         help="whisper.cpp language code (default: en). Also sent as 'language' in --streaming POST bodies.",
     )
     parser.add_argument(
+        "--speaker-threshold",
+        type=float,
+        default=DEFAULT_SPEAKER_THRESHOLD,
+        help=(
+            f"Cosine-similarity threshold (0-1) for matching a segment to an existing speaker vs. "
+            f"registering a new one (default: {DEFAULT_SPEAKER_THRESHOLD}). Algorithmic (MFCC + pitch, "
+            f"no ML model) - tune per mic/room with 'python speaker_id.py --device N --seconds 30'."
+        ),
+    )
+    parser.add_argument(
         "--streaming",
         action="store_true",
         help="POST each transcribed sentence to --url instead of writing a log file.",
@@ -310,7 +360,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--url",
         type=str,
         default=None,
-        help="Endpoint to POST {sentence, model, language, session_id} to for each sentence. Required with --streaming.",
+        help="Endpoint to POST {sentence, model, language, session_id, speaker_id} to for each sentence. Required with --streaming.",
     )
     args = parser.parse_args(argv)
 

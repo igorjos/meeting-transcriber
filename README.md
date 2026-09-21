@@ -10,13 +10,18 @@ capture_windows.py     Windows: WASAPI loopback (PyAudioWPatch)
 capture_macos.py       macOS: ScreenCaptureKit audio capture
 audio_common.py      Shared types/downmix/resample used by both backends
 vad.py               Silero VAD, streaming -> speech-segment queue
+speaker_id.py        Pure-numpy MFCC/pitch voiceprint -> per-segment speaker id (no ML model)
 transcribe.py        main entrypoint: whisper.cpp (pywhispercpp) -> stdout + log file (or --streaming POSTs)
-run_macos.sh          Interactive launcher (macOS): prompts for model/mode, runs in background
+run_macos.sh          Interactive launcher (macOS): prompts for model/mode, then runs until Ctrl+C
 run_windows.ps1        Interactive launcher (Windows): prompts for model/mode, runs in background
 ```
 
 Capture and inference run on separate threads connected by `queue.Queue`, so
-a slow transcription pass never drops or blocks audio capture.
+a slow transcription pass never drops or blocks audio capture. Speaker
+identification (`speaker_id.py`) runs synchronously inside the inference
+step instead of on its own thread — a handful of small FFTs per segment is
+trivial next to a whisper.cpp inference call, so a dedicated thread would
+just be overhead.
 
 ## Setup
 
@@ -115,18 +120,28 @@ killing the process never loses a completed segment.
 Instead of remembering flags, run the interactive launcher — it prompts for
 the model (including quantization), the capture device (lists devices for
 you first, blank = auto-detected default), streaming vs. log-file mode, and
-the URL/filename that mode needs, then starts `transcribe.py` in the
-background until you press Ctrl+C. On first run (or if `.venv` is missing or
+the URL/filename that mode needs, then starts `transcribe.py` and keeps it
+running until you press Ctrl+C (press it again to force-quit if shutdown
+stalls). On first run (or if `.venv` is missing or
 broken) it also walks you through creating/repairing the virtualenv:
 
 ```bash
 # macOS
 ./run_macos.sh
+
+# If it's not executable (e.g. downloaded as a zip instead of git-cloned,
+# which doesn't preserve the +x bit), either chmod it once or run it via
+# bash directly - no chmod needed either way:
+bash run_macos.sh
 ```
 
 ```powershell
-# Windows (if scripts are blocked, run once: Set-ExecutionPolicy -Scope CurrentUser RemoteSigned)
+# Windows, from PowerShell (if scripts are blocked, run once:
+# Set-ExecutionPolicy -Scope CurrentUser RemoteSigned)
 .\run_windows.ps1
+
+# From cmd.exe, or to run it once without changing the execution policy:
+powershell -ExecutionPolicy Bypass -File run_windows.ps1
 ```
 
 ### Flags
@@ -139,8 +154,9 @@ broken) it also walks you through creating/repairing the virtualenv:
 | `--output PATH` | `transcripts\transcript.log` | Transcript log file (appended to, flushed after every line). Ignored with `--streaming`. |
 | `--threads N` | `4` | CPU threads for whisper.cpp inference. |
 | `--language CODE` | `en` | whisper.cpp language code. Also sent as `language` in `--streaming` POST bodies. |
+| `--speaker-threshold N` | `0.84` | Cosine-similarity threshold (0-1) for matching a segment's voiceprint to an existing speaker vs. registering a new one. Algorithmic (MFCC + pitch, no ML model) — a rough starting point; tune it per mic/room with `python speaker_id.py --device N --seconds 30`, which prints each segment's similarity score live. Quiet/whispered segments (no reliable pitch) are matched on timbre alone against a separate, lower, internally-fixed bar — see "Speaker identification" below. |
 | `--streaming` | off | POST each transcribed sentence to `--url` instead of writing a log file (log file is disabled in this mode). Requires `--url`. |
-| `--url URL` | — | Endpoint to POST `{"sentence": ..., "model": ..., "language": ..., "session_id": ...}` (JSON) to for each transcribed sentence. Required with `--streaming`; must start with `http://` or `https://` (validated at startup). Session ID is a unique identifier generated when the app starts, allowing you to correlate all sentences from a single transcription session. POSTs happen on a background thread with a small retry, so a slow/unreachable endpoint never stalls transcription. |
+| `--url URL` | — | Endpoint to POST `{"sentence": ..., "model": ..., "language": ..., "session_id": ..., "speaker_id": ...}` (JSON) to for each transcribed sentence. Required with `--streaming`; must start with `http://` or `https://` (validated at startup). Session ID is a unique identifier generated when the app starts, allowing you to correlate all sentences from a single transcription session; speaker ID is a per-session integer (1, 2, 3, ...) from the speaker-identification registry described below. POSTs happen on a background thread with a small retry, so a slow/unreachable endpoint never stalls transcription. |
 
 ## Model choice
 
@@ -151,6 +167,68 @@ models work too via `--model`, just bigger downloads.
 
 Battle-tested with `base.en-q5_1` (English) capturing Google Meet in a
 browser and the Teams desktop app.
+
+## Speaker identification
+
+Every line is attributed to a speaker, e.g.:
+
+```
+[14:02:11 - Person 1] said: So where should we start?
+[14:02:14 - Person 2] said: Actually, can I jump in real quick?
+[14:02:16 - Person 1] said: sure, go ahead.
+```
+
+This is done algorithmically (`speaker_id.py`), not with a second ML model:
+each VAD-detected speech segment is reduced to a compact "voiceprint" — MFCC
+(timbre) and pitch statistics computed with plain signal-processing math —
+and matched by cosine similarity against a small, in-memory, growing
+registry of previously seen voiceprints (one compact vector per speaker,
+not stored raw audio, so comparison stays fast regardless of meeting
+length). The registry starts empty and has no fixed size, so it scales to
+however many people actually speak, not a hardcoded count.
+
+Worth knowing:
+
+- **Session-scoped only.** "Person 3" is not guaranteed to be the same
+  person in a future run — nothing is persisted to disk between runs.
+- **Turn-taking and interruptions separated by a pause are attributed
+  correctly** — each VAD segment (bounded by ~400ms of silence on both
+  sides) gets its own independent speaker lookup, including short ones like
+  "Wait!". **True simultaneous overlapping speech is not split** — capture
+  is a single mixed-down audio channel, not per-person microphones, so two
+  people talking at the exact same time land in one blended voiceprint.
+- **Less discriminative than a neural speaker-embedding model, by design**
+  (see above for why one wasn't added) — expect more confusion between
+  similar-sounding speakers as the number of participants grows, especially
+  people with similar pitch and vocal timbre.
+- **`--speaker-threshold`'s default (`0.84`) is a starting point**,
+  calibrated against synthetic speech with simulated room reverb rather
+  than real recordings — genuine same-speaker similarity drops well below
+  the 0.99+ you'd see from a clean, echo-free recording once real room
+  acoustics and natural pitch/prosody variation (e.g. a rising tone when
+  asking a question vs. flatter when explaining) are in play. Tune it
+  against your own mic/room with the standalone debug CLI (see "Debugging
+  capture/VAD/speaker-id in isolation" under Troubleshooting below), which
+  prints every segment's assigned speaker and similarity score live. Lower
+  the threshold if the same person keeps getting split into multiple
+  "Person N" entries; raise it if different people are getting merged into
+  one. Quiet/whispered segments with no reliable pitch are matched by
+  timbre alone against a separate, lower bar (not exposed as a flag) since
+  that comparison has no pitch to help confirm a match, so it scores lower
+  even for a correct same-speaker match.
+- **New speakers require failing to match *every* known speaker, not just
+  "the closest one wasn't a clear enough winner."** Earlier builds also
+  rejected a match when the best and second-best known speakers scored too
+  close to each other, meant to avoid confidently guessing between two
+  similar-sounding *different* people — but it backfired badly if two
+  registered entries ever ended up representing the *same* real person
+  (e.g. after one earlier borderline miss): every later segment from that
+  person would then be "ambiguous" between those two near-duplicates by
+  construction, fail that check forever, and register a brand new speaker
+  on every single segment — reported as a continuously climbing "Person N"
+  count for one continuous speaker in an echoey room, never stopping. That
+  check has been removed; a segment now simply joins whichever known
+  speaker it matches best, as long as that match clears the threshold.
 
 ## Troubleshooting
 
@@ -181,25 +259,31 @@ Recording permission as described under Setup above, then quit and reopen
 the app/terminal you're running Python from (a permission grant doesn't take
 effect for an already-running process) and retry.
 
-**Debugging capture/VAD in isolation.** Both modules are runnable standalone
-before you ever touch `transcribe.py`:
+**Debugging capture/VAD/speaker-id in isolation.** All three are runnable
+standalone before you ever touch `transcribe.py`. `speaker_id.py` prints
+each segment's assigned speaker and similarity score, which is also how you
+tune `--speaker-threshold` against your own mic/room before trusting it in
+a real meeting:
 
 ```powershell
 # Windows
 .\.venv\Scripts\python.exe capture.py --device 10 --seconds 5 --wav test.wav
 .\.venv\Scripts\python.exe vad.py --device 10 --seconds 10
+.\.venv\Scripts\python.exe speaker_id.py --device 10 --seconds 30 --threshold 0.84
 ```
 
 ```bash
 # macOS
 ./.venv/bin/python capture.py --device 0 --seconds 5 --wav test.wav
 ./.venv/bin/python vad.py --device 0 --seconds 10
+./.venv/bin/python speaker_id.py --device 0 --seconds 30 --threshold 0.84
 ```
 
 ## Tests
 
 `tests/` covers the pure, hardware-free helpers (audio downmix/resample math,
-filler-line filtering, `--url` validation) with stdlib `unittest`:
+filler-line filtering, `--url` validation, speaker-voiceprint extraction and
+clustering) with stdlib `unittest`:
 
 ```powershell
 # Windows

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Interactive launcher for macOS: prompts for model, streaming vs log-file
-# mode, and the URL/filename that mode needs, then runs transcribe.py in
-# the background until interrupted (Ctrl+C).
+# mode, and the URL/filename that mode needs, then runs transcribe.py until
+# interrupted (Ctrl+C).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -128,9 +128,10 @@ fi
 
 echo
 echo "Starting: $PY ${TRANSCRIBE_ARGS[*]}"
-"$PY" "${TRANSCRIBE_ARGS[@]}" &
-PID=$!
-echo "Running in background (PID $PID). Press Ctrl+C to stop."
+echo "Running (PID $$). Press Ctrl+C to stop (press it again to force-quit if shutdown stalls)."
 
-trap 'kill -INT "$PID" 2>/dev/null || true' INT TERM
-wait "$PID"
+# exec, not `&` + wait: a job started with `&` from a non-interactive script
+# inherits "ignore SIGINT", so Python never installs its Ctrl+C handler and
+# keeps running after the launcher exits. exec makes the app the foreground
+# process, so the terminal's Ctrl+C reaches it directly.
+exec "$PY" "${TRANSCRIBE_ARGS[@]}"

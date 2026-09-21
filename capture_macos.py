@@ -50,6 +50,7 @@ AUDIO_SAMPLE_RATE = 48000  # what we ask SCStreamConfiguration for
 AUDIO_CHANNELS = 2
 
 _TCC_DENIED_CODE = -3801  # SCStreamErrorDomain: user/OS declined capture permission
+_USER_STOPPED_CODE = -3817  # SCStreamErrorDomain: stream stopped via the system's stop-sharing control
 _MAX_AUDIO_BUFFERS = 2  # stereo is delivered as 1 interleaved buffer; allow up to 2 defensively
 
 
@@ -261,6 +262,7 @@ class LoopbackCapture:
         self._handler: Optional[_StreamHandler] = None
         self._device_info: Optional[dict] = None
         self._error: Optional[BaseException] = None
+        self._stopped_by_user = False
         self._frames_captured = 0
         self._bytes_captured = 0
         self._resample_state = None
@@ -281,6 +283,10 @@ class LoopbackCapture:
     @property
     def bytes_captured(self) -> int:
         return self._bytes_captured
+
+    @property
+    def stopped_by_user(self) -> bool:
+        return self._stopped_by_user
 
     def start(self) -> None:
         content = _get_shareable_content()
@@ -413,6 +419,16 @@ class LoopbackCapture:
             pass
 
     def _on_stream_error(self, error) -> None:
+        code = None
+        try:
+            code = error.code()
+        except Exception:
+            pass
+        if self._stop_event.is_set() or code == _USER_STOPPED_CODE:
+            # Deliberate stop (our own .stop() call, or the user stopping it
+            # via the system's stop-sharing control) - not a real failure.
+            self._stopped_by_user = True
+            return
         self._error = NoAudioError(f"ScreenCaptureKit stream stopped unexpectedly: {error}")
 
     def stop(self, timeout: float = 2.0) -> None:
