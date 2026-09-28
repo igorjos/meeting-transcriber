@@ -13,6 +13,23 @@ setlocal
 title Transcriber
 cd /d "%~dp0"
 
+if not exist "%~dp0run_windows.ps1" (
+    echo.
+    echo ERROR: run_windows.ps1 is missing from this folder.
+    echo.
+    echo This usually means this file was opened straight from inside the
+    echo .zip archive, or from a SharePoint/OneDrive location that has not
+    echo finished syncing - only this one file gets copied out, not the
+    echo rest of the project.
+    echo.
+    echo Fix: close this window, right-click the meeting-transcriber .zip
+    echo file and choose Extract All, then run run_windows.cmd from the
+    echo extracted folder ^(not from inside the zip preview^).
+    echo.
+    pause
+    exit /b 1
+)
+
 powershell -NoProfile -Command "Unblock-File -LiteralPath '%~dp0run_windows.ps1'" >nul 2>&1
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0run_windows.ps1"
 

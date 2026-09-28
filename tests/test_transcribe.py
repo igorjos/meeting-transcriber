@@ -59,6 +59,43 @@ class _Server:
         self._server.server_close()
 
 
+class _FixedResponseServer:
+    """Real local HTTP server that always answers every request with a fixed
+    status code (and headers), and counts how many requests it received - for
+    testing that a client error isn't retried and a redirect isn't followed."""
+
+    def __init__(self, status: int, headers: "dict[str, str]" = None):
+        self.request_count = 0
+        outer = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                self.rfile.read(int(self.headers.get("Content-Length", 0)))
+                outer.request_count += 1
+                self.send_response(status)
+                for name, value in (headers or {}).items():
+                    self.send_header(name, value)
+                self.end_headers()
+
+            def log_message(self, *_args):
+                pass
+
+        self._server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self._server.daemon_threads = True
+
+    @property
+    def url(self) -> str:
+        return f"http://127.0.0.1:{self._server.server_port}/endpoint"
+
+    def __enter__(self) -> "_FixedResponseServer":
+        threading.Thread(target=self._server.serve_forever, daemon=True).start()
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        self._server.shutdown()
+        self._server.server_close()
+
+
 def _quiet():
     """Capture stdout+stderr so expected warnings don't clutter test output."""
     stack = contextlib.ExitStack()
@@ -181,6 +218,35 @@ class MainArgumentTests(unittest.TestCase):
         self.assertEqual(seen["topic"], "-leading dash")
         self.assertEqual(seen["email"], "me@example.com")
 
+    def test_run_wires_the_topic_into_the_streaming_poster(self):
+        # A real call to run() (not run itself mocked away, unlike the test above) -
+        # only SentencePoster's constructor is intercepted, and capture is made to
+        # fail immediately (NoAudioError, the real "no such device" exception) so
+        # this never touches real audio hardware/VAD/whisper. SentencePoster is
+        # constructed before cap.start() in run(), so this still exercises the real
+        # wiring for the one thing this test cares about.
+        args = argparse.Namespace(
+            streaming=True, url="http://localhost:1/ingest", model="m", language="en",
+            headers={}, topic="Acme kickoff", email=None, store_url=None, output="unused.log",
+            device=None, threads=4, speaker_threshold=0.84,
+        )
+        captured = {}
+
+        class _FakePoster:
+            def __init__(self, *a, **kw):
+                captured.update(kw)
+
+            def stop(self):
+                pass
+
+        with mock.patch.object(transcribe, "SentencePoster", _FakePoster), \
+             mock.patch.object(transcribe, "LoopbackCapture") as fake_cap_cls:
+            fake_cap_cls.return_value.start.side_effect = transcribe.NoAudioError("no device")
+            stack, _out, _err = _quiet()
+            with stack:
+                transcribe.run(args)
+        self.assertEqual(captured.get("topic"), "Acme kickoff")
+
 
 class TranscriptWriterTests(unittest.TestCase):
     def test_start_offset_is_zero_for_a_new_file(self):
@@ -288,6 +354,47 @@ class UploadLogFileTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("could not read", err.getvalue())
 
+    def test_a_redirect_is_reported_and_not_silently_followed(self):
+        # Left to urllib's default, a 302 to a POST is followed as a body-less
+        # GET - the upload would vanish while _upload_log_file still reported
+        # success, and our headers (including any --auth-header) would be
+        # resent to whatever host the redirect names.
+        with _FixedResponseServer(302, {"Location": "http://example.invalid/elsewhere"}) as server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                log_path = Path(tmpdir) / "x.log"
+                log_path.write_text("hello\n", encoding="utf-8")
+                stack, _out, err = _quiet()
+                with stack:
+                    ok = transcribe._upload_log_file(server.url, log_path, "sid", max_retries=2)
+            self.assertFalse(ok)
+            self.assertEqual(server.request_count, 1)  # not retried, not followed
+        self.assertIn("redirected", err.getvalue())
+        self.assertIn("http://example.invalid/elsewhere", err.getvalue())
+
+    def test_a_client_error_is_reported_and_not_retried(self):
+        with _FixedResponseServer(401) as server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                log_path = Path(tmpdir) / "x.log"
+                log_path.write_text("hello\n", encoding="utf-8")
+                stack, _out, err = _quiet()
+                with stack:
+                    ok = transcribe._upload_log_file(server.url, log_path, "sid", max_retries=2)
+            self.assertFalse(ok)
+            self.assertEqual(server.request_count, 1)
+        self.assertIn("401", err.getvalue())
+        self.assertIn("not retrying", err.getvalue())
+
+    def test_a_server_error_is_still_retried(self):
+        with _FixedResponseServer(503) as server:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                log_path = Path(tmpdir) / "x.log"
+                log_path.write_text("hello\n", encoding="utf-8")
+                stack, _out, err = _quiet()
+                with stack:
+                    ok = transcribe._upload_log_file(server.url, log_path, "sid", max_retries=2)
+            self.assertFalse(ok)
+            self.assertEqual(server.request_count, 3)  # 1 + 2 retries, unlike a 4xx
+
 
 class SessionUploadTests(unittest.TestCase):
     def test_uploads_only_this_sessions_part_of_an_append_only_log(self):
@@ -388,6 +495,51 @@ class SentencePosterTests(unittest.TestCase):
         self.assertEqual(json.loads(request["body"])["sentence"], "hello there")
         self.assertEqual(request["headers"]["Authorization"], "Bearer t0k")
         self.assertEqual(request["headers"]["Content-Type"], "application/json")
+
+    def test_posts_the_topic(self):
+        with _Server() as server:
+            poster = transcribe.SentencePoster(server.url, "m", "en", "sess", topic="Acme kickoff")
+            poster.post("hello", 1)
+            poster.stop()
+        self.assertEqual(json.loads(server.requests[0]["body"])["topic"], "Acme kickoff")
+
+    def test_topic_defaults_to_an_empty_string_not_null(self):
+        with _Server() as server:
+            poster = transcribe.SentencePoster(server.url, "m", "en", "sess")
+            poster.post("hello", 1)
+            poster.stop()
+        self.assertEqual(json.loads(server.requests[0]["body"])["topic"], "")
+
+    def test_a_redirect_is_reported_and_not_silently_followed(self):
+        with _FixedResponseServer(302, {"Location": "http://example.invalid/elsewhere"}) as server:
+            poster = transcribe.SentencePoster(server.url, "m", "en", "sess", max_retries=2)
+            stack, _out, err = _quiet()
+            with stack:
+                poster.post("hello", 1)
+                poster.stop()
+        self.assertEqual(server.request_count, 1)
+        self.assertIn("redirected", err.getvalue())
+        self.assertIn("http://example.invalid/elsewhere", err.getvalue())
+
+    def test_a_client_error_is_reported_and_not_retried(self):
+        with _FixedResponseServer(404) as server:
+            poster = transcribe.SentencePoster(server.url, "m", "en", "sess", max_retries=2)
+            stack, _out, err = _quiet()
+            with stack:
+                poster.post("hello", 1)
+                poster.stop()
+        self.assertEqual(server.request_count, 1)
+        self.assertIn("404", err.getvalue())
+        self.assertIn("not retrying", err.getvalue())
+
+    def test_a_server_error_is_still_retried(self):
+        with _FixedResponseServer(500) as server:
+            poster = transcribe.SentencePoster(server.url, "m", "en", "sess", max_retries=2)
+            stack, _out, err = _quiet()
+            with stack:
+                poster.post("hello", 1)
+                poster.stop(timeout=5)
+        self.assertEqual(server.request_count, 3)
 
     def test_stop_does_not_hang_and_warns_when_the_endpoint_is_stuck_with_a_full_backlog(self):
         stack, _out, err = _quiet()

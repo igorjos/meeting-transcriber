@@ -36,18 +36,51 @@ try {
         $candidates = @()
         if (Get-Command py -ErrorAction SilentlyContinue) {
             foreach ($ver in @("3.13", "3.12", "3.11", "3.10", "3.9")) {
-                & py "-$ver" -c "" 2>$null
+                # A version the `py` launcher doesn't have installed writes to
+                # stderr ("No suitable Python runtime found..."); redirecting
+                # that with 2>$null still turns it into an ErrorRecord first,
+                # which $ErrorActionPreference = "Stop" would then throw on -
+                # silencing it that way instead of at the source stops this
+                # whole probe loop (and the script) on the very first missing
+                # version, before ever reaching a prompt.
+                #
+                # The one-liner is "pass", not "" - Windows PowerShell 5.1 drops an
+                # empty-string argument entirely when building a native command's
+                # command line, so `-c ""` actually reaches py.exe as bare `-c` with
+                # nothing after it, which Python rejects ("Argument expected for the
+                # -c option") for *every* version probed, installed or not - this
+                # silently emptied $candidates of every "py -X.Y" entry regardless of
+                # what's actually installed. A non-empty argument isn't dropped.
+                $ErrorActionPreference = "SilentlyContinue"
+                & py "-$ver" -c "pass" 2>$null
+                $ErrorActionPreference = "Stop"
                 if ($LASTEXITCODE -eq 0) {
                     $candidates += "py -$ver"
                 }
             }
         }
+        $probedVersionFound = $candidates.Count -gt 0
         foreach ($name in @("python3", "python")) {
             if (Get-Command $name -ErrorAction SilentlyContinue) {
                 $candidates += $name
             }
         }
         $candidates += "Other (enter a command or path)"
+
+        if (-not $probedVersionFound) {
+            # None of 3.9-3.13 (the versions this project is known to work with)
+            # were found via the `py` launcher - whatever "python"/"python3"
+            # below resolves to might be a much newer release that this
+            # project's dependencies (torch in particular) don't have
+            # ready-built packages for yet, which can make the install below
+            # fail partway through. Not fatal - just worth knowing before
+            # picking it.
+            Write-Host "Note: no Python 3.9-3.13 installation was found via the 'py' launcher."
+            Write-Host "If 'python'/'python3' below turns out to be a much newer release, dependency"
+            Write-Host "installation can fail - see the Windows section of README.md for the"
+            Write-Host "recommended version if that happens."
+            Write-Host ""
+        }
 
         Write-Host "Select the Python interpreter to create the virtualenv with:"
         for ($i = 0; $i -lt $candidates.Count; $i++) {
@@ -92,19 +125,34 @@ try {
     # e.g. created with the wrong interpreter, or dependencies were never
     # actually installed into it. Catch that now instead of launching
     # transcribe.py and having it die instantly.
+    #
+    # Each `2>$null` below silences the *text* of a failure, but under
+    # $ErrorActionPreference = "Stop" the redirect itself still promotes any
+    # stderr line to an ErrorRecord first, which then throws right there -
+    # bypassing the $LASTEXITCODE check on the next line entirely and ending
+    # the script with no useful message. Turning EAP off just for the native
+    # call (and back on immediately after, before anything else can throw)
+    # keeps the intended behavior: check $LASTEXITCODE ourselves, decide what
+    # to do about it.
+    $ErrorActionPreference = "SilentlyContinue"
     & $py -c "import sys; sys.exit(0 if sys.version_info[:2] >= (3, 11) else 1)" 2>$null
+    $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0) {
         $ver = & $py --version 2>&1
         throw "$py is $ver, but this project requires Python 3.11+. Fix: remove $VenvDir and re-run this script (then pick a 3.11+ interpreter)."
     }
 
+    $ErrorActionPreference = "SilentlyContinue"
     & $py -c "import numpy" 2>$null
+    $ErrorActionPreference = "Stop"
     if ($LASTEXITCODE -ne 0) {
         Write-Host "$VenvDir exists but required packages aren't installed in it - installing now..."
         & $py -m pip install --upgrade pip
         & $py -m pip install -r requirements.txt
         Write-Host ""
+        $ErrorActionPreference = "SilentlyContinue"
         & $py -c "import numpy" 2>$null
+        $ErrorActionPreference = "Stop"
         if ($LASTEXITCODE -ne 0) {
             throw "Dependency install into $VenvDir failed. Re-run manually to see why: $py -m pip install -r requirements.txt"
         }
@@ -228,6 +276,15 @@ try {
     Write-Host ""
     Write-Host "Available capture devices:"
     & $py -m transcribe --list-devices
+    if ($LASTEXITCODE -ne 0) {
+        # The most common real cause here is torch (a silero-vad dependency,
+        # imported as soon as transcribe.py loads, --list-devices or not)
+        # failing to load its native DLLs - visible above as an error
+        # mentioning c10.dll. Stop now with the fix rather than continuing
+        # through more questions only to hit the exact same crash later,
+        # when actually starting the session.
+        throw "Failed to list capture devices (see the error above). The most common cause on Windows is a missing VC++ Redistributable (x64) - see the link near the top of the Windows section in README.md, install it, then retry."
+    }
     Write-Host ""
     $device = Read-Host "Device index from the list above (leave blank for auto-detected default)"
 

@@ -12,7 +12,7 @@ Usage:
     python -m transcribe --device 10 --topic "Acme kickoff" --email me@example.com
         (first line of the transcript: start time, model, language, topic, email)
     python -m transcribe --device 10 --streaming --url http://localhost:8000/ingest
-        (each POST body includes: {sentence, model, language, session_id, speaker_id})
+        (each POST body includes: {sentence, model, language, session_id, speaker_id, topic})
     python -m transcribe --device 10 --output transcripts\\meeting.log --store-url http://localhost:8000/store
         (uploads this session's part of the log file as multipart/form-data, field
         "log", filename = the log's own name, when the session ends - including on
@@ -117,6 +117,27 @@ def _build_multipart_body(field_name: str, filename: str, content: bytes) -> "tu
     return body, f"multipart/form-data; boundary={boundary}"
 
 
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Blocks urllib's default of transparently following a 3xx redirect. Left alone, a
+    redirect turns our POST into a body-less GET on the new URL (per HTTP semantics for
+    301/302/303) - the upload/sentence would silently vanish while we still report
+    success - and resends our headers, including --auth-header, to whatever host the
+    redirect names. redirect_request() returning None makes urlopen()/opener.open()
+    raise HTTPError(<the 3xx code>) instead of following it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_NO_REDIRECT_OPENER = urllib.request.build_opener(_NoRedirectHandler)
+
+
+def _urlopen_no_redirect(req: urllib.request.Request, timeout: float):
+    """Like urllib.request.urlopen(req, timeout=timeout), but raises HTTPError on a 3xx
+    response instead of following it - see _NoRedirectHandler."""
+    return _NO_REDIRECT_OPENER.open(req, timeout=timeout)
+
+
 def _upload_log_file(
     store_url: str,
     path: Path,
@@ -135,20 +156,43 @@ def _upload_log_file(
     still complete either way.
     """
     try:
-        data = path.read_bytes()
+        with open(path, "rb") as fh:
+            # Seek straight to this session's part rather than reading the whole
+            # (potentially many-session-long) file into memory just to slice it -
+            # unless the file is now shorter than start_offset (e.g. truncated/
+            # replaced since this session started), in which case upload all of it.
+            size = os.fstat(fh.fileno()).st_size
+            fh.seek(start_offset if size >= start_offset else 0)
+            content = fh.read()
     except OSError as exc:
         print(f"WARNING: could not read {path} to upload to {store_url}: {exc}", file=sys.stderr)
         return False
-    content = data[start_offset:] if len(data) >= start_offset else data
 
     body, content_type = _build_multipart_body("log", path.name, content)
     headers = {**(extra_headers or {}), "Content-Type": content_type, "X-Session-Id": session_id}
     for attempt in range(max_retries + 1):
         req = urllib.request.Request(store_url, data=body, method="POST", headers=headers)
         try:
-            urllib.request.urlopen(req, timeout=timeout).close()
+            _urlopen_no_redirect(req, timeout).close()
             print(f"Uploaded transcript log ({path}) to {store_url}")
             return True
+        except urllib.error.HTTPError as exc:
+            if 300 <= exc.code < 400:
+                location = (exc.headers.get("Location") if exc.headers else None) or "<no Location header>"
+                print(
+                    f"WARNING: {store_url} redirected (HTTP {exc.code}) to {location} instead of accepting the "
+                    f"upload - redirects are not followed (one would silently drop the file and could resend "
+                    f"--auth-header to a different host). Point --store-url at {location} directly.",
+                    file=sys.stderr,
+                )
+                return False
+            if 400 <= exc.code < 500:  # a client error (bad URL, missing/rejected auth, ...) won't fix itself on retry
+                print(f"WARNING: {store_url} rejected the upload (HTTP {exc.code} {exc.reason}) - not retrying.", file=sys.stderr)
+                return False
+            if attempt < max_retries:
+                time.sleep(0.5)
+            else:
+                print(f"WARNING: failed to upload transcript log to {store_url}: {exc}", file=sys.stderr)
         except (urllib.error.URLError, OSError) as exc:
             if attempt < max_retries:
                 time.sleep(0.5)
@@ -229,6 +273,7 @@ class SentencePoster:
         max_retries: int = 2,
         timeout: float = 5.0,
         extra_headers: Optional["dict[str, str]"] = None,
+        topic: Optional[str] = None,
     ):
         self.extra_headers = extra_headers or {}
         self.url = url
@@ -237,6 +282,7 @@ class SentencePoster:
         self.session_id = session_id
         self.max_retries = max_retries
         self.timeout = timeout
+        self.topic = topic or ""
 
         self._queue: "queue.Queue[Optional[tuple[str, int]]]" = queue.Queue(maxsize=256)
         self._thread = threading.Thread(target=self._run, name="sentence-poster", daemon=True)
@@ -263,6 +309,7 @@ class SentencePoster:
                 "language": self.language,
                 "session_id": self.session_id,
                 "speaker_id": speaker_id,
+                "topic": self.topic,
             }
         ).encode("utf-8")
         for attempt in range(self.max_retries + 1):
@@ -273,8 +320,32 @@ class SentencePoster:
                 headers={**self.extra_headers, "Content-Type": "application/json"},
             )
             try:
-                urllib.request.urlopen(req, timeout=self.timeout).close()
+                _urlopen_no_redirect(req, timeout=self.timeout).close()
                 return
+            except urllib.error.HTTPError as exc:
+                if 300 <= exc.code < 400:
+                    location = (exc.headers.get("Location") if exc.headers else None) or "<no Location header>"
+                    print(
+                        f"WARNING: {self.url} redirected (HTTP {exc.code}) to {location} instead of accepting the "
+                        f"sentence - redirects are not followed. Point --url at {location} directly. Dropping: {sentence!r}",
+                        file=sys.stderr,
+                    )
+                    return
+                if 400 <= exc.code < 500:  # a client error won't fix itself on retry
+                    print(
+                        f"WARNING: {self.url} rejected the sentence (HTTP {exc.code} {exc.reason}) - not retrying. "
+                        f"Dropping: {sentence!r}",
+                        file=sys.stderr,
+                    )
+                    return
+                if attempt < self.max_retries:
+                    time.sleep(0.5 * (attempt + 1))
+                else:
+                    print(
+                        f"WARNING: failed to POST sentence to {self.url} after "
+                        f"{self.max_retries + 1} attempts: {exc}",
+                        file=sys.stderr,
+                    )
             except (urllib.error.URLError, OSError) as exc:
                 if attempt < self.max_retries:
                     time.sleep(0.5 * (attempt + 1))
@@ -361,7 +432,7 @@ def run(args: argparse.Namespace) -> int:
     poster: Optional[SentencePoster] = None
     if args.streaming:
         print(f"{_session_header(session_start, args)} | streaming to {args.url}")
-        poster = SentencePoster(args.url, args.model, args.language, session_id, extra_headers=args.headers)
+        poster = SentencePoster(args.url, args.model, args.language, session_id, extra_headers=args.headers, topic=args.topic)
     else:
         writer = TranscriptWriter(Path(args.output))
         writer.write(_session_header(session_start, args))
@@ -513,7 +584,23 @@ def run(args: argparse.Namespace) -> int:
     return exit_code
 
 
+def _make_console_output_lenient() -> None:
+    """A transcribed sentence, or a --topic/--email value, can contain a character
+    that stdout's encoding can't represent (e.g. Windows with output redirected
+    under a legacy console code page) - without this, that one print() call
+    raises UnicodeEncodeError and crashes the session. The transcript log file
+    itself is always opened as UTF-8 (see TranscriptWriter) and is unaffected -
+    this only changes what the console echo falls back to instead of crashing."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass  # not a reconfigurable TextIOWrapper (e.g. redirected to something exotic) - leave it be
+
+
 def main(argv: Optional[List[str]] = None) -> None:
+    _make_console_output_lenient()
+
     parser = argparse.ArgumentParser(
         prog="python -m transcribe",
         description="Real-time transcription of system/speaker audio (Teams, Zoom, etc.).",
@@ -570,7 +657,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         "--url",
         type=str,
         default=None,
-        help="Endpoint to POST {sentence, model, language, session_id, speaker_id} to for each sentence. Required with --streaming.",
+        help="Endpoint to POST {sentence, model, language, session_id, speaker_id, topic} to for each sentence. Required with --streaming.",
     )
     parser.add_argument(
         "--store-url",
