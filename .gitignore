@@ -6,3 +6,5 @@ models/*.gguf
 transcripts/*.log
 transcripts/*.wav
 .DS_Store
+.env
+.env.tmp

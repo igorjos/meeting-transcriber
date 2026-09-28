@@ -2,15 +2,19 @@
 hardware needed."""
 from __future__ import annotations
 
+import contextlib
+import io
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import numpy as np
 
-from audio_common import TARGET_RATE, downmix_to_mono, resample_to_target
+import audio_common
+from audio_common import TARGET_RATE, DropWarner, downmix_to_mono, resample_to_target
 
 
 class DownmixToMonoTests(unittest.TestCase):
@@ -52,6 +56,32 @@ class ResampleToTargetTests(unittest.TestCase):
         out2, state2 = resample_to_target(pcm, 48000, state1)
         self.assertIsInstance(out1, bytes)
         self.assertIsInstance(out2, bytes)
+
+
+class DropWarnerTests(unittest.TestCase):
+    def _run(self, times):
+        """Record one drop at each fake-clock time in `times`; return (warner, stderr text)."""
+        warner = DropWarner("audio chunk(s)", interval_s=5.0)
+        err = io.StringIO()
+        clock = iter(times)
+        with mock.patch.object(audio_common.time, "monotonic", side_effect=lambda: next(clock)), \
+                contextlib.redirect_stderr(err):
+            for _ in times:
+                warner.record()
+        return warner, err.getvalue()
+
+    def test_first_drop_warns_immediately(self):
+        warner, err = self._run([100.0])
+        self.assertEqual(warner.total, 1)
+        self.assertIn("dropped 1 audio chunk(s)", err)
+
+    def test_drops_within_the_interval_are_batched_into_one_later_warning(self):
+        warner, err = self._run([100.0, 101.0, 102.0, 103.0, 106.0])
+        self.assertEqual(warner.total, 5)
+        self.assertEqual(err.count("WARNING"), 2)
+        self.assertIn("dropped 1 audio chunk(s)", err.splitlines()[0])
+        self.assertIn("dropped 4 audio chunk(s)", err.splitlines()[1])
+        self.assertIn("5 total", err.splitlines()[1])
 
 
 if __name__ == "__main__":

@@ -1,24 +1,27 @@
+# Version ceilings are one major above what this was developed/tested against
+# (numpy 2.4, silero-vad 6.2, pywhispercpp 1.5, pyobjc 12.2) so a future
+# breaking release can't silently break a fresh install.
 # --- Audio capture ---
 # Windows: WASAPI loopback via PyAudioWPatch.
-PyAudioWPatch>=0.2.12.7; sys_platform == "win32"
+PyAudioWPatch>=0.2.12.7,<0.3; sys_platform == "win32"
 # macOS: ScreenCaptureKit (macOS 13+) audio capture via PyObjC bindings.
 # No virtual audio driver / Multi-Output Device needed, but the process
 # running this (your terminal, or python3.x if run directly) must be granted
 # Screen Recording permission in System Settings > Privacy & Security ->
 # Screen Recording - required by macOS for any system-audio capture, even
 # though no video is recorded.
-pyobjc-framework-Cocoa>=10.1; sys_platform == "darwin"
-pyobjc-framework-ScreenCaptureKit>=10.1; sys_platform == "darwin"
-pyobjc-framework-CoreMedia>=10.1; sys_platform == "darwin"
-pyobjc-framework-CoreAudio>=10.1; sys_platform == "darwin"
-pyobjc-framework-libdispatch>=10.1; sys_platform == "darwin"
+pyobjc-framework-Cocoa>=10.1,<13; sys_platform == "darwin"
+pyobjc-framework-ScreenCaptureKit>=10.1,<13; sys_platform == "darwin"
+pyobjc-framework-CoreMedia>=10.1,<13; sys_platform == "darwin"
+pyobjc-framework-CoreAudio>=10.1,<13; sys_platform == "darwin"
+pyobjc-framework-libdispatch>=10.1,<13; sys_platform == "darwin"
 
 # --- Numerics / resampling ---
-numpy>=1.24
+numpy>=1.24,<3
 # audio_common.py uses stdlib `audioop`, removed from the standard library in
 # Python 3.13 - this restores it (same module name/API) so 3.13+ venvs don't
 # pass every setup check and then die at the first audio chunk.
-audioop-lts>=0.2.1; python_version >= "3.13"
+audioop-lts>=0.2.1,<1; python_version >= "3.13"
 
 # --- VAD ---
 # NOTE: the silero-vad PyPI package hard-depends on torch/torchaudio even
@@ -26,11 +29,11 @@ audioop-lts>=0.2.1; python_version >= "3.13"
 # the heaviest install in this project (~a few hundred MB), unrelated to the
 # ASR model choice below. On Windows this also needs the Microsoft Visual
 # C++ Redistributable (x64) installed for torch's native DLLs to load.
-silero-vad>=5.1
+silero-vad>=5.1,<7
 
 # --- ASR (whisper.cpp bindings) ---
 # Builds/links whisper.cpp under the hood. On Windows this needs the
 # "Desktop development with C++" workload (MSVC + CMake) unless a
 # prebuilt wheel is available for your Python/OS combo. On macOS this
 # typically builds cleanly against Xcode Command Line Tools.
-pywhispercpp>=1.2.0
+pywhispercpp>=1.2.0,<2

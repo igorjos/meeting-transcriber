@@ -20,7 +20,16 @@ from typing import Optional
 
 import pyaudiowpatch as pyaudio
 
-from audio_common import CHUNK_MS, SAMPLE_WIDTH, TARGET_RATE, LoopbackDevice, NoAudioError, downmix_to_mono, resample_to_target
+from audio_common import (
+    CHUNK_MS,
+    SAMPLE_WIDTH,
+    TARGET_RATE,
+    DropWarner,
+    LoopbackDevice,
+    NoAudioError,
+    downmix_to_mono,
+    resample_to_target,
+)
 
 
 def _default_loopback_index(pa: "pyaudio.PyAudio") -> Optional[int]:
@@ -106,6 +115,7 @@ class LoopbackCapture:
         self._error: Optional[BaseException] = None
         self._frames_captured = 0
         self._bytes_captured = 0
+        self._drops = DropWarner("audio chunk(s)")
 
     @property
     def device_info(self) -> Optional[dict]:
@@ -161,7 +171,11 @@ class LoopbackCapture:
                 try:
                     raw = self._stream.read(frames_per_chunk, exception_on_overflow=False)
                 except Exception as exc:  # PortAudio/device errors
-                    self._error = exc
+                    # stop() closes the stream to unblock this very read, so
+                    # a failure while stopping is expected, not a device error
+                    # (raise_if_failed() after stop() would otherwise report it).
+                    if not self._stop_event.is_set():
+                        self._error = exc
                     break
 
                 if not raw:
@@ -204,7 +218,7 @@ class LoopbackCapture:
                     self.out_queue.put(mono, timeout=1.0)
                 except queue.Full:
                     # Consumer is stalled; drop this chunk rather than block capture.
-                    pass
+                    self._drops.record()
         finally:
             self._close_stream()
 

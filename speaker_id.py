@@ -108,15 +108,16 @@ _TIMBRE_DIM = 2 * NUM_MFCC  # mean+std block length; used to slice out pitch for
 # starting point - tune with the CLI below.
 DEFAULT_SPEAKER_THRESHOLD = 0.84
 
-# Separate, lower bar for the timbre-only ("masked") cosine comparison used
-# when a segment has no reliable pitch (see identify() below) - that
-# comparison has no pitch dims to help confirm a match, so even a correct
-# same-speaker match scores meaningfully lower than a full-vector one:
-# measured ~0.78-0.82 for genuinely pitch-less (quiet/whispered/very short)
-# segments of the same synthetic speaker, comfortably under
-# DEFAULT_SPEAKER_THRESHOLD but still well clear of a different speaker.
-# Kept at the main threshold's previous, separately-calibrated value.
-MASKED_MATCH_THRESHOLD = 0.75
+# The timbre-only ("masked") cosine comparison is used whenever either side
+# of a comparison has no reliable pitch (see SpeakerRegistry._similarities) -
+# it has no pitch dims to help confirm a match, so even a correct same-speaker
+# match scores meaningfully lower than a full-vector one: measured ~0.78-0.82
+# for genuinely pitch-less (quiet/whispered/very short) segments of the same
+# synthetic speaker, comfortably under DEFAULT_SPEAKER_THRESHOLD but still
+# well clear of a different speaker. Its bar is the main threshold minus this
+# offset (0.84 - 0.09 = the previously separately-calibrated 0.75), so tuning
+# --speaker-threshold moves both bars together instead of leaving one stuck.
+MASKED_THRESHOLD_OFFSET = 0.09
 MAX_CENTROID_WEIGHT = 50  # caps how "frozen" a centroid can get
 
 
@@ -293,6 +294,10 @@ class SpeakerRegistry:
     def num_speakers(self) -> int:
         return len(self._centroids)
 
+    @property
+    def masked_threshold(self) -> float:
+        return max(0.0, self.threshold - MASKED_THRESHOLD_OFFSET)
+
     def identify(self, audio: np.ndarray) -> int:
         vec = extract_voiceprint(audio)
         if vec is None:
@@ -308,40 +313,17 @@ class SpeakerRegistry:
         best_score = second_score = float("nan")
         if self._centroids:
             centroids = np.stack(self._centroids)
-            # A pitch block is either a weighted Gaussian bump (never exactly
-            # zero) or exactly all-zero (see extract_voiceprint) - so this
-            # exact-zero check reliably detects "no reliable pitch for this
-            # segment" (too short/unvoiced/quiet).
-            if np.any(vec[_TIMBRE_DIM:] != 0.0):
-                sims = centroids @ vec  # unit vectors -> dot product == cosine sim
-                match_threshold = self.threshold
-            else:
-                # Comparing the full vector here would compare this
-                # segment's all-zero pitch block against centroids that do
-                # have real pitch content, capping the best possible cosine
-                # similarity at ~0.43 (2 unit blocks vs. 3) regardless of
-                # how well the timbre actually matches - in practice this
-                # meant a run of quiet/whispered/very short segments could
-                # never match their own speaker and instead minted a new
-                # "Person N" on every single one. Falling back to a
-                # timbre-only (masked) cosine similarity - dropping the
-                # pitch dims from both sides - avoids that ceiling. No
-                # renormalization is needed: cosine similarity is invariant
-                # to scaling either side by a positive constant, so slicing
-                # both vectors to the same dims and taking their raw dot
-                # product over their real norms is already a correct cosine
-                # over just those dims.
-                timbre = vec[:_TIMBRE_DIM]
-                timbre_norm = np.linalg.norm(timbre)
-                centroid_timbre = centroids[:, :_TIMBRE_DIM]
-                centroid_norms = np.linalg.norm(centroid_timbre, axis=1)
-                denom = np.maximum(timbre_norm * centroid_norms, 1e-9)
-                sims = (centroid_timbre @ timbre) / denom
-                match_threshold = MASKED_MATCH_THRESHOLD
-            best_idx = int(np.argmax(sims))
+            sims, thresholds = self._similarities(centroids, vec)
+            # Rank by how far each similarity clears *its own* bar: a
+            # full-vector and a timbre-only similarity live on different
+            # scales, so comparing raw scores across the two would favor
+            # whichever comparison happens to run higher.
+            margins = sims - thresholds
+            order = np.argsort(margins)
+            best_idx = int(order[-1])
             best_score = float(sims[best_idx])
             if len(sims) > 1:
-                second_score = float(np.partition(sims, -2)[-2])  # diagnostic only, see below
+                second_score = float(sims[int(order[-2])])  # diagnostic only, see below
 
             # Assign to the best match whenever it clears the threshold -
             # regardless of how close the runner-up scored. An earlier
@@ -359,7 +341,7 @@ class SpeakerRegistry:
             # softer, self-correcting failure - the centroid update below
             # keeps nudging the closer one back into shape - than spawning a
             # new identity, which only compounds.
-            if best_score >= match_threshold:
+            if margins[best_idx] >= 0.0:
                 self._update_centroid(best_idx, vec)
                 speaker_id = best_idx + 1
                 self._last_speaker_id = speaker_id
@@ -373,11 +355,72 @@ class SpeakerRegistry:
         self.last_match = SpeakerMatch(speaker_id, best_score, second_score, True)
         return speaker_id
 
+    def _similarities(self, centroids: np.ndarray, vec: np.ndarray) -> "tuple[np.ndarray, np.ndarray]":
+        """Per-centroid (similarity, threshold that similarity must clear).
+
+        A pitch block is either a weighted Gaussian bump (never exactly zero)
+        or exactly all-zero (see extract_voiceprint) - so an exact-zero check
+        reliably detects "no reliable pitch" (too short/unvoiced/quiet), for
+        the incoming segment and for a stored centroid alike (a speaker whose
+        very first segment was quiet is registered without any pitch).
+
+        When both sides have pitch, the full-vector cosine is used. When
+        either side lacks it, comparing the full vectors would compare a
+        zero pitch block against a real one, capping the best possible cosine
+        at ~0.43 (2 unit blocks vs. 3) for the incoming-quiet case and
+        ~0.82 for the stored-quiet case, regardless of how well the timbre
+        actually matches - so a run of quiet segments could never re-match
+        their own speaker, and a speaker introduced by a quiet segment could
+        never be matched by their normal speech. The fallback is a
+        timbre-only (masked) cosine over just the MFCC dims. No
+        renormalization is needed: cosine similarity is invariant to scaling
+        either side by a positive constant, so slicing both vectors to the
+        same dims and dividing by their real norms is already a correct
+        cosine over just those dims.
+        """
+        query_has_pitch = bool(np.any(vec[_TIMBRE_DIM:] != 0.0))
+        centroid_has_pitch = np.any(centroids[:, _TIMBRE_DIM:] != 0.0, axis=1)
+        use_full = centroid_has_pitch & query_has_pitch
+
+        full_sims = centroids @ vec  # unit vectors -> dot product == cosine sim
+
+        timbre = vec[:_TIMBRE_DIM]
+        centroid_timbre = centroids[:, :_TIMBRE_DIM]
+        denom = np.maximum(np.linalg.norm(timbre) * np.linalg.norm(centroid_timbre, axis=1), 1e-9)
+        masked_sims = (centroid_timbre @ timbre) / denom
+
+        sims = np.where(use_full, full_sims, masked_sims)
+        thresholds = np.where(use_full, self.threshold, self.masked_threshold)
+        return sims, thresholds
+
     def _update_centroid(self, idx: int, vec: np.ndarray) -> None:
-        # Running mean, weight capped so a chatty speaker's centroid never
-        # fully "freezes" - a bad early segment can still be diluted out.
+        centroid = self._centroids[idx]
+        centroid_has_pitch = bool(np.any(centroid[_TIMBRE_DIM:] != 0.0))
+        vec_has_pitch = bool(np.any(vec[_TIMBRE_DIM:] != 0.0))
+
+        if centroid_has_pitch and not vec_has_pitch:
+            # A pitch-less (quiet/whispered/very short) segment is weak, and
+            # differently-distributed, evidence: it's good enough to
+            # attribute the segment to this speaker but not to reshape their
+            # voiceprint. Averaging it in as zeros shrank the pitch block ~5x
+            # after five such segments, and even averaging only its timbre
+            # dragged the centroid toward noisy quiet-speech timbre until the
+            # speaker's own normal segments stopped matching.
+            return
+
+        if vec_has_pitch and not centroid_has_pitch:
+            # The centroid was built from quiet segments only; a real voiced
+            # segment is a much better reference for every later full-vector
+            # comparison, so it replaces it.
+            self._centroids[idx] = vec
+            self._counts[idx] = 1
+            return
+
+        # Both have pitch (or neither does - the zero pitch blocks average to
+        # zero): running mean, weight capped so a chatty speaker's centroid
+        # never fully "freezes" - a bad early segment can still be diluted out.
         n = min(self._counts[idx], self.max_centroid_weight)
-        self._centroids[idx] = _l2_normalize((self._centroids[idx] * n + vec) / (n + 1))
+        self._centroids[idx] = _l2_normalize((centroid * n + vec) / (n + 1))
         self._counts[idx] += 1
 
 

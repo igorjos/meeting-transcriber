@@ -12,8 +12,10 @@ audio_common.py      Shared types/downmix/resample used by both backends
 vad.py               Silero VAD, streaming -> speech-segment queue
 speaker_id.py        Pure-numpy MFCC/pitch voiceprint -> per-segment speaker id (no ML model)
 transcribe.py        main entrypoint: whisper.cpp (pywhispercpp) -> stdout + log file (or --streaming POSTs)
-run_macos.sh          Interactive launcher (macOS): prompts for model/mode, then runs until Ctrl+C
-run_windows.ps1        Interactive launcher (Windows): prompts for model/mode, runs in background
+settings.py          Saved launcher settings (.env) + the value validators shared with transcribe.py
+run_macos.sh          Interactive launcher (macOS): prompts for email/model/topic/mode, then runs until Ctrl+C
+run_windows.ps1        Interactive launcher (Windows): prompts for email/model/topic/mode, then runs until Ctrl+C
+run_windows.cmd        Double-click entry point (Windows): runs run_windows.ps1 for you, no PowerShell knowledge needed
 ```
 
 Capture and inference run on separate threads connected by `queue.Queue`, so
@@ -29,18 +31,69 @@ Requires Python 3.11.
 
 ### Windows
 
+#### Windows quick start (never used PowerShell? start here)
+
+1. Install **Python 3.11 or newer**: <https://www.python.org/downloads/windows/>
+   → download the installer → run it → on the very first screen, **tick
+   "Add python.exe to PATH"** before clicking Install (easy to miss; if
+   you skip it, step 4 below won't find Python).
+2. Install the
+   [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)
+   → run the downloaded file → Install. (This is a required piece for the
+   speech-recognition library this app uses; without it the app will error
+   out with a message mentioning `c10.dll` — see Troubleshooting below.)
+3. Download this project and unzip it somewhere ordinary, e.g. your
+   `Documents` folder (avoid `Downloads` — Windows sometimes restricts
+   scripts that stay in that folder).
+4. Open the unzipped folder and **double-click `run_windows.cmd`**
+   (not `run_windows.ps1` — that one opens in a text editor instead of
+   running, since Windows doesn't run `.ps1` files by double-click).
+   - If a blue **"Windows protected your PC"** screen appears, click
+     **"More info"**, then **"Run anyway"**. Windows shows this for any
+     script downloaded from the internet, including this one; it isn't a
+     sign anything is wrong.
+   - A black window (the console) opens. The first run takes a few minutes
+     — it's creating a private Python environment for this app and
+     installing everything it needs. Leave it be until it asks you a
+     question.
+5. Answer the questions as they come (your email, which speech model to
+   use, the meeting/client name, which audio device to capture, etc.) — see
+   [Flags](#flags) below for what each one means. Pressing Enter on a
+   bracketed `[default]` question accepts that default.
+6. Once you see `Listening...`, the app is capturing audio. To stop it,
+   click into the window and press **Ctrl+C** once, then wait a few seconds
+   for it to shut down cleanly (press it a second time only if it seems
+   stuck). The window then shows a **"Press Enter to close this window"**
+   prompt — read whatever it printed above that first, then press Enter to
+   close it.
+7. If the window ever closes (or shows an error and asks you to press
+   Enter) before you get that far, it now always prints the reason first —
+   see "The window opens and closes immediately" under Troubleshooting
+   below for what the common ones mean.
+
+Every later run is faster — just double-click `run_windows.cmd` again; it
+remembers your email, model and a couple of other answers from last time
+(see [Saved settings](#saved-settings-env) below) and only asks what's new.
+
+#### What `run_windows.cmd` / `run_windows.ps1` actually do
+
 Also needs the
 [Microsoft Visual C++ Redistributable (x64)](https://aka.ms/vs/17/release/vc_redist.x64.exe)
 (needed for torch's native DLLs — `silero-vad` depends on torch).
 
-Run `.\run_windows.ps1` — if `.venv` doesn't exist yet, it lets you pick
-which Python to create it with (it probes the `py` launcher for 3.13 down to
-3.9, plus `python3`/`python` on `PATH`, plus an "Other" option for a custom
-command/path) and installs `requirements.txt` into it automatically. It also
-double-checks an existing `.venv` before using it — verifies the interpreter
-is 3.11+ and that dependencies actually import (auto-(re)installing
-`requirements.txt` if not) — so a broken/incomplete setup fails with a clear
-message instead of launching and dying silently.
+Run `.\run_windows.ps1` (or just double-click `run_windows.cmd`, which runs
+it for you without needing PowerShell set up - see the quick start above) —
+if `.venv` doesn't exist yet, it lets you pick which Python to create it
+with (it probes the `py` launcher for 3.13 down to 3.9, plus `python3`/
+`python` on `PATH`, plus an "Other" option for a custom command/path) and
+installs `requirements.txt` into it automatically. It also double-checks an
+existing `.venv` before using it — verifies the interpreter is 3.11+ and
+that dependencies actually import (auto-(re)installing `requirements.txt`
+if not) — so a broken/incomplete setup fails with a clear message instead
+of launching and dying silently. The whole script runs inside one
+try/catch: whatever goes wrong, and whenever it happens - a setup failure,
+a bad answer, transcribe.py itself exiting - the window prints why before
+it closes and waits for you to press Enter, instead of just vanishing.
 
 To set up manually instead:
 
@@ -118,12 +171,14 @@ killing the process never loses a completed segment.
 ### Launcher scripts
 
 Instead of remembering flags, run the interactive launcher — it prompts for
-the model (including quantization), the capture device (lists devices for
-you first, blank = auto-detected default), streaming vs. log-file mode, and
-the URL/filename that mode needs, then starts `transcribe.py` and keeps it
-running until you press Ctrl+C (press it again to force-quit if shutdown
-stalls). On first run (or if `.venv` is missing or
-broken) it also walks you through creating/repairing the virtualenv:
+your email, the model (including quantization), the client name / meeting
+topic, the capture device (lists devices for you first, blank =
+auto-detected default), streaming vs. log-file mode, and the URL/filename
+that mode needs (log-file mode also asks whether to upload the finished file
+to a store URL), then starts `transcribe.py` and keeps it running until you
+press Ctrl+C (press it again to force-quit if shutdown stalls). On first run
+(or if `.venv` is missing or broken) it also walks you through
+creating/repairing the virtualenv:
 
 ```bash
 # macOS
@@ -144,6 +199,62 @@ bash run_macos.sh
 powershell -ExecutionPolicy Bypass -File run_windows.ps1
 ```
 
+### Saved settings (`.env`)
+
+The answers that rarely change between meetings are remembered in a `.env`
+file next to the launcher, so you're only asked for what's missing:
+
+| Saved | Key in `.env` | Asked when |
+|---|---|---|
+| Email | `TRANSCRIBER_EMAIL` | always needed |
+| Whisper model | `TRANSCRIBER_MODEL` | always needed |
+| Streaming endpoint | `TRANSCRIBER_URL` | streaming mode |
+| API key header (`Name: value`) | `TRANSCRIBER_AUTH_HEADER` | when either endpoint is used; a blank answer is saved as "needs no key" so you aren't asked again |
+
+On each start the launcher lists what's saved (the API key masked to its
+last 4 characters) and asks **"Change any of the saved settings?"** — `n`
+uses them all as-is; `y` walks through the ones this run needs with the
+saved value as the default (Enter keeps it; type `none` at the API-key
+prompt to remove it). Anything missing is asked for and saved right away.
+
+The **client name / meeting topic** and the **store (upload) URL are never
+saved** — both are asked fresh every session, even when their other settings
+(email, model, streaming URL) come from `.env`. The topic lands only on the
+log's first line (below); the store URL is only asked in log-file mode, when
+you choose to upload. Delete `.env` to forget everything else.
+
+- **Format**: `KEY=value` lines; whole-line `#` comments and other lines are
+  left alone when the launcher rewrites the file; optional surrounding quotes
+  are stripped; there are no inline comments. Values must be a single line of
+  printable ASCII, and are validated (email shape, `http(s)://` URL, header
+  `Name: value`) before they're saved.
+- **The API key prompt is plain text, not hidden** — it's typed and echoed
+  like any other answer. It still never goes on the command line: the
+  launcher hands it to `transcribe.py` through the `TRANSCRIBER_AUTH_HEADER`
+  environment variable, so it doesn't appear in the process list or the
+  "Starting:" line.
+- **The file holds the key in plain text.** It's git-ignored and written
+  owner-only (`0600`) on macOS/Linux; on Windows it inherits the folder's
+  permissions, so keep the project in your user profile.
+- `settings.py` is also a small CLI the launchers use (`show`, `get KEY`,
+  `set KEY` with the value in `$SETTINGS_VALUE`); `transcribe.py` itself never
+  reads `.env`, so running it directly behaves exactly as before.
+
+### First line of the log
+
+Every session starts with one header line — start time, whisper model,
+language, and (when given) the client/topic and your email:
+
+```
+# Transcript started 2026-09-25T10:30:05 | model=base.en-q5_1 | language=en | topic=Acme kickoff | email=me@example.com
+```
+
+Line breaks and control characters in the topic are flattened to spaces and
+`|` (the field separator) becomes `/`, so a value can't spill onto a second
+line. With `--streaming` the same line is printed to the console (plus
+`| streaming to <url>`); the per-sentence POST body is unchanged. The header
+is also the first line of the file uploaded by `--store-url`.
+
 ### Flags
 
 | Flag | Default | Description |
@@ -154,9 +265,13 @@ powershell -ExecutionPolicy Bypass -File run_windows.ps1
 | `--output PATH` | `transcripts\transcript.log` | Transcript log file (appended to, flushed after every line). Ignored with `--streaming`. |
 | `--threads N` | `4` | CPU threads for whisper.cpp inference. |
 | `--language CODE` | `en` | whisper.cpp language code. Also sent as `language` in `--streaming` POST bodies. |
-| `--speaker-threshold N` | `0.84` | Cosine-similarity threshold (0-1) for matching a segment's voiceprint to an existing speaker vs. registering a new one. Algorithmic (MFCC + pitch, no ML model) — a rough starting point; tune it per mic/room with `python speaker_id.py --device N --seconds 30`, which prints each segment's similarity score live. Quiet/whispered segments (no reliable pitch) are matched on timbre alone against a separate, lower, internally-fixed bar — see "Speaker identification" below. |
+| `--topic TEXT` | — | Client name or meeting topic, written to the first line of the transcript (the launchers always ask for it). |
+| `--email ADDRESS` | — | Your email address, written to the first line of the transcript; must look like `name@example.com`. |
+| `--speaker-threshold N` | `0.84` | Cosine-similarity threshold (0-1) for matching a segment's voiceprint to an existing speaker vs. registering a new one. Algorithmic (MFCC + pitch, no ML model) — a rough starting point; tune it per mic/room with `python speaker_id.py --device N --seconds 30`, which prints each segment's similarity score live. Quiet/whispered segments (no reliable pitch) are matched on timbre alone against a bar 0.09 below this value — see "Speaker identification" below. |
 | `--streaming` | off | POST each transcribed sentence to `--url` instead of writing a log file (log file is disabled in this mode). Requires `--url`. |
 | `--url URL` | — | Endpoint to POST `{"sentence": ..., "model": ..., "language": ..., "session_id": ..., "speaker_id": ...}` (JSON) to for each transcribed sentence. Required with `--streaming`; must start with `http://` or `https://` (validated at startup). Session ID is a unique identifier generated when the app starts, allowing you to correlate all sentences from a single transcription session; speaker ID is a per-session integer (1, 2, 3, ...) from the speaker-identification registry described below. POSTs happen on a background thread with a small retry, so a slow/unreachable endpoint never stalls transcription. |
+| `--store-url URL` | — | Log-file mode only (cannot be combined with `--streaming`). When the session ends, POSTs **this session's part** of the local log file (`--output`) to this endpoint as `multipart/form-data` (file field `log`, filename = the log's own name, plus an `X-Session-Id` header) — earlier sessions already in an appended-to log file are not re-sent. Must start with `http://` or `https://` (validated at startup; plain `http://` to a non-local host prints a warning). Also sent on a forced exit (second Ctrl+C), using whatever has been written so far. Sent at most once: one retry and a 15s limit normally, one 3s attempt and a 4s limit on a forced exit; a failed or timed-out upload only prints a warning and never affects the local log. |
+| `--auth-header 'Name: value'` | — | Extra HTTP header (e.g. `Authorization: Bearer <token>`) added to every POST (`--url` and `--store-url`). Prefer setting the `TRANSCRIBER_AUTH_HEADER` environment variable instead, so the secret doesn't show up in the process list or shell history (the launchers set it for you from the saved API key). |
 
 ## Model choice
 
@@ -213,9 +328,10 @@ Worth knowing:
   the threshold if the same person keeps getting split into multiple
   "Person N" entries; raise it if different people are getting merged into
   one. Quiet/whispered segments with no reliable pitch are matched by
-  timbre alone against a separate, lower bar (not exposed as a flag) since
-  that comparison has no pitch to help confirm a match, so it scores lower
-  even for a correct same-speaker match.
+  timbre alone against a bar 0.09 below `--speaker-threshold` (so it moves
+  with it) since that comparison has no pitch to help confirm a match, so it
+  scores lower even for a correct same-speaker match. Such quiet matches
+  attribute the segment but never alter the speaker's stored voiceprint.
 - **New speakers require failing to match *every* known speaker, not just
   "the closest one wasn't a clear enough winner."** Earlier builds also
   rejected a match when the best and second-best known speakers scored too
@@ -231,6 +347,31 @@ Worth knowing:
   speaker it matches best, as long as that match clears the threshold.
 
 ## Troubleshooting
+
+**The window opens and closes immediately (Windows).** As of this app's
+current version, this should no longer happen silently: `run_windows.ps1`
+always prints why it's closing and waits for **Enter** before the window
+closes, and `run_windows.cmd` (the recommended double-click entry point —
+see the [Windows quick start](#windows-quick-start-never-used-powershell-start-here)
+above) keeps the window open even if `run_windows.ps1` itself couldn't
+start. If you still see a window flash and vanish with no message at all,
+you're most likely running `run_windows.ps1` directly (not via
+`run_windows.cmd`) in a way that doesn't leave a window open to read from —
+double-click `run_windows.cmd` instead. The most common actual reasons,
+once you can read the message:
+- **"...cannot be loaded because running scripts is disabled on this
+  system"** — a PowerShell execution-policy restriction.
+  `run_windows.cmd` already works around this for you; if you're launching
+  `run_windows.ps1` directly, use
+  `powershell -ExecutionPolicy Bypass -File run_windows.ps1` instead of a
+  plain double-click.
+- **"...is not digitally signed. You cannot run this script..."** —
+  Windows marked the downloaded file as untrusted ("Mark of the Web").
+  `run_windows.cmd` clears this automatically; running the `.ps1` directly
+  instead, right-click it → Properties → tick **Unblock** → OK, and retry.
+- **Torch / `c10.dll` failed to load**, **Python not found**, or
+  **dependency install failed** — see the specific entries below; the
+  window's own message names which one it is and how to fix it.
 
 **"No audio captured" / nothing gets transcribed.** By far the most common
 cause is the wrong `--device` index. On Windows, loopback device indices are
@@ -281,9 +422,19 @@ a real meeting:
 
 ## Tests
 
-`tests/` covers the pure, hardware-free helpers (audio downmix/resample math,
-filler-line filtering, `--url` validation, speaker-voiceprint extraction and
-clustering) with stdlib `unittest`:
+`tests/` covers the hardware-free logic with stdlib `unittest`: audio
+downmix/resample and drop warnings, filler-line filtering, URL/header
+validation, the saved-settings `.env` store, the log header, the log upload and
+streaming POSTs (against a real local HTTP server), the real `run_macos.sh`
+prompt flow (bash, against a stand-in app), static checks on `run_windows.ps1`/
+`run_windows.cmd` (no PowerShell here to run either for real - see
+`tests/test_windows_launcher_static.py`'s docstring for exactly what a static
+check can and can't catch), VAD segmentation, speaker-voiceprint extraction
+and clustering, the
+Windows capture backend (against a fake `pyaudiowpatch`), and the real
+`transcribe.run()` shutdown paths — first/second/third Ctrl+C, upload on exit,
+failing segments — in a subprocess with capture/VAD/whisper faked
+(`tests/shutdown_harness.py`):
 
 ```powershell
 # Windows

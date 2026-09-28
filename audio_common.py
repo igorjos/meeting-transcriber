@@ -9,6 +9,8 @@ that normalization isn't duplicated per backend.
 from __future__ import annotations
 
 import audioop
+import sys
+import time
 from dataclasses import dataclass
 from typing import Optional
 
@@ -57,3 +59,30 @@ def resample_to_target(mono_pcm16: bytes, in_rate: int, state=None) -> tuple[byt
     if in_rate == TARGET_RATE:
         return mono_pcm16, state
     return audioop.ratecv(mono_pcm16, SAMPLE_WIDTH, 1, in_rate, TARGET_RATE, state)
+
+
+class DropWarner:
+    """Counts items dropped because a downstream queue was full and prints a
+    rate-limited warning, so overload shows up as a message instead of
+    silently missing audio/speech. The first drop warns immediately; later
+    ones are batched into at most one warning per `interval_s`."""
+
+    def __init__(self, what: str, interval_s: float = 5.0):
+        self.what = what
+        self.interval_s = interval_s
+        self.total = 0
+        self._since_last_warning = 0
+        self._last_warning = float("-inf")
+
+    def record(self) -> None:
+        self.total += 1
+        self._since_last_warning += 1
+        now = time.monotonic()
+        if now - self._last_warning >= self.interval_s:
+            print(
+                f"WARNING: dropped {self._since_last_warning} {self.what} because the next stage "
+                f"can't keep up ({self.total} total this session).",
+                file=sys.stderr,
+            )
+            self._last_warning = now
+            self._since_last_warning = 0

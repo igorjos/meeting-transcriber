@@ -44,7 +44,7 @@ import Foundation
 import objc
 import ScreenCaptureKit as SCK
 
-from audio_common import CHUNK_MS, LoopbackDevice, NoAudioError, downmix_to_mono, resample_to_target
+from audio_common import CHUNK_MS, DropWarner, LoopbackDevice, NoAudioError, downmix_to_mono, resample_to_target
 
 AUDIO_SAMPLE_RATE = 48000  # what we ask SCStreamConfiguration for
 AUDIO_CHANNELS = 2
@@ -266,6 +266,7 @@ class LoopbackCapture:
         self._frames_captured = 0
         self._bytes_captured = 0
         self._resample_state = None
+        self._drops = DropWarner("audio chunk(s)")
 
         self._lock = threading.Lock()
         self._last_data_time: Optional[float] = None
@@ -416,7 +417,7 @@ class LoopbackCapture:
             self.out_queue.put(resampled, timeout=1.0)
         except queue.Full:
             # Consumer is stalled; drop this chunk rather than block capture.
-            pass
+            self._drops.record()
 
     def _on_stream_error(self, error) -> None:
         code = None

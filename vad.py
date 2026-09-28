@@ -22,6 +22,8 @@ from typing import Optional
 import numpy as np
 from silero_vad import VADIterator, load_silero_vad
 
+from audio_common import DropWarner
+
 SAMPLE_RATE = 16000
 WINDOW_SAMPLES = 512  # fixed window size required by the 16 kHz Silero model
 WINDOW_BYTES = WINDOW_SAMPLES * 2  # PCM16 -> 2 bytes/sample
@@ -74,6 +76,7 @@ class VoiceActivityDetector:
         self._speech_frames: list[np.ndarray] = []
         self._speech_start_sample: Optional[int] = None
         self._samples_seen = 0
+        self._drops = DropWarner("speech segment(s)")
 
     def start(self) -> None:
         self._stop_event.clear()
@@ -131,6 +134,10 @@ class VoiceActivityDetector:
                 # keeps getting bounded-length segments and stdout stays live.
                 self._emit_segment()
                 self._iterator.reset_states()
+                # The pre-roll still holds the tail of the segment just
+                # emitted; left in place, the next "start" would prepend it
+                # and the ~200ms around the split would be transcribed twice.
+                self._pre_roll.clear()
 
     def _emit_segment(self) -> None:
         if not self._speech_frames:
@@ -147,7 +154,7 @@ class VoiceActivityDetector:
         try:
             self.out_queue.put(segment, timeout=1.0)
         except queue.Full:
-            pass
+            self._drops.record()
 
 
 # --------------------------------------------------------------------------

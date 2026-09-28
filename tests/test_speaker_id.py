@@ -345,6 +345,53 @@ class SpeakerRegistryTests(unittest.TestCase):
         self.assertFalse(registry.last_match.is_new)
         self.assertEqual(registry.num_speakers, 2)
 
+    def test_quiet_segments_do_not_dilute_a_speakers_pitch(self):
+        # Regression: a pitch-less (quiet/whispered) segment that matched a
+        # speaker used to be averaged into the centroid's pitch block as
+        # zeros - five of them shrank it ~5x, after which that speaker's own
+        # next normal segment scored ~0.68 and was registered as a new person.
+        # Quiet matches now attribute the segment but leave the centroid alone.
+        harmonics = [1.0, 0.5, 0.25]
+        registry = speaker_id.SpeakerRegistry()
+        speaker_a = registry.identify(_synthetic_voice(120.0, harmonics, seed=1))
+        registry.identify(_synthetic_voice(260.0, [1.0, 0.15], seed=2))
+        before = registry._centroids[0].copy()
+
+        quiet = _whispered_voice(120.0, harmonics, seed=20)
+        self.assertEqual(registry.identify(quiet), speaker_a)
+        self.assertFalse(registry.last_match.is_new)
+
+        quiet_vec = speaker_id.extract_voiceprint(quiet)
+        for _ in range(60):
+            registry._update_centroid(0, quiet_vec)
+        np.testing.assert_array_equal(registry._centroids[0], before)
+
+        again = registry.identify(_synthetic_voice(128.0, harmonics, seed=999))
+        self.assertEqual(again, speaker_a)
+        self.assertEqual(registry.num_speakers, 2)
+
+    def test_speaker_first_seen_quietly_is_matched_by_their_normal_speech(self):
+        # Regression: a speaker registered from a quiet segment has no pitch
+        # in their centroid, capping any normal (pitched) segment's full-vector
+        # cosine at ~0.82 - under the 0.84 default - so their normal speech
+        # was always registered as a second person.
+        harmonics = [1.0, 0.5, 0.25]
+        registry = speaker_id.SpeakerRegistry()
+        first = registry.identify(_whispered_voice(120.0, harmonics, seed=20))
+        self.assertTrue(np.all(registry._centroids[0][speaker_id._TIMBRE_DIM :] == 0.0))
+
+        for seed in (30, 31, 32):
+            self.assertEqual(registry.identify(_synthetic_voice(120.0, harmonics, seed=seed)), first)
+        self.assertEqual(registry.num_speakers, 1)
+        # ...and the centroid picked up the pitch it was missing.
+        self.assertTrue(np.any(registry._centroids[0][speaker_id._TIMBRE_DIM :] != 0.0))
+        self.assertAlmostEqual(float(np.linalg.norm(registry._centroids[0])), 1.0, places=4)
+
+    def test_masked_threshold_follows_the_main_threshold(self):
+        self.assertAlmostEqual(speaker_id.SpeakerRegistry().masked_threshold, 0.75, places=6)
+        self.assertAlmostEqual(speaker_id.SpeakerRegistry(threshold=0.9).masked_threshold, 0.81, places=6)
+        self.assertEqual(speaker_id.SpeakerRegistry(threshold=0.05).masked_threshold, 0.0)
+
     def test_moderately_similar_voices_are_kept_separate_at_the_raised_threshold(self):
         # Regression test for a real-world report: at the old 0.75 default,
         # too many genuinely different speakers were being merged into one
